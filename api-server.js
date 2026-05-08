@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const puppeteer = require('puppeteer-core');
+const puppeteer = require('puppeteer');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
 const path = require('path');
@@ -27,7 +27,6 @@ async function initBrowser(proxyServer = null) {
   browser = await puppeteer.launch({
     headless: true,
     defaultViewport: null,
-    executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     args
   });
   console.log('Browser initialized' + (proxyServer ? ` with proxy: ${proxyServer}` : ''));
