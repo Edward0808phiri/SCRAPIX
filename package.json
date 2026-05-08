@@ -4,8 +4,7 @@
   "description": "",
   "main": "api-server.js",
   "scripts": {
-    "start": "node api-server.js",
-    "postinstall": "npx puppeteer browsers install chrome"
+    "start": "node api-server.js"
   },
   "keywords": [],
   "author": "",

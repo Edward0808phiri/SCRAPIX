@@ -17,19 +17,21 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 let browser = null;
 
-// Initialize browser on startup
+// Initialize browser via browserless.io
 async function initBrowser(proxyServer = null) {
-  const args = ['--no-sandbox', '--disable-setuid-sandbox'];
+  const token = process.env.BROWSERLESS_TOKEN;
+  if (!token) throw new Error('BROWSERLESS_TOKEN env var is required');
+
+  let wsEndpoint = `wss://chrome.browserless.io?token=${token}`;
   if (proxyServer) {
-    args.push(`--proxy-server=${proxyServer}`);
+    wsEndpoint += `&--proxy-server=${encodeURIComponent(proxyServer)}`;
   }
-  
-  browser = await puppeteer.launch({
-    headless: true,
+
+  browser = await puppeteer.connect({
+    browserWSEndpoint: wsEndpoint,
     defaultViewport: null,
-    args
   });
-  console.log('Browser initialized' + (proxyServer ? ` with proxy: ${proxyServer}` : ''));
+  console.log('Browser connected to browserless.io' + (proxyServer ? ` with proxy: ${proxyServer}` : ''));
 }
 
 // Scrape a single URL with filtering options
