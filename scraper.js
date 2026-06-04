@@ -1,5 +1,5 @@
 require('dotenv').config();
-const puppeteer = require('puppeteer-core');
+const puppeteer = require('puppeteer');
 const { createClient } = require('@supabase/supabase-js');
 
 const supabaseUrl = process.env.REACT_APP_SUPABASE_URL;

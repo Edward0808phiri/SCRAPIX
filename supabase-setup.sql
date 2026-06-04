@@ -7,14 +7,19 @@ CREATE TABLE IF NOT EXISTS headlines (
   source TEXT NOT NULL,
   title TEXT NOT NULL,
   link TEXT NOT NULL,
+  published_at TIMESTAMP WITH TIME ZONE,   -- date the article was published (from the source)
   scraped_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- 1b. Migration for existing databases: add published_at if the table predates it
+ALTER TABLE headlines ADD COLUMN IF NOT EXISTS published_at TIMESTAMP WITH TIME ZONE;
 
 -- 2. Create unique index on link to prevent duplicates
 CREATE UNIQUE INDEX IF NOT EXISTS headlines_link_unique ON headlines(link);
 
--- 3. Create index on scraped_at for fast queries
+-- 3. Create indexes for fast ordering (newest published first, then scrape time)
 CREATE INDEX IF NOT EXISTS headlines_scraped_at_idx ON headlines(scraped_at DESC);
+CREATE INDEX IF NOT EXISTS headlines_published_at_idx ON headlines(published_at DESC NULLS LAST);
 
 -- 4. Enable Row Level Security
 ALTER TABLE headlines ENABLE ROW LEVEL SECURITY;

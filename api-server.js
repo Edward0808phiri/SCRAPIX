@@ -15,6 +15,10 @@ const supabaseUrl = process.env.REACT_APP_SUPABASE_URL;
 const supabaseKey = process.env.REACT_APP_SUPABASE_PUBLISHABLE_DEFAULT_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// Realistic desktop UA — some regulator sites serve an empty DOM to the default
+// headless user agent.
+const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
 let browser = null;
 
 // Initialize browser via browserless.io
@@ -22,7 +26,9 @@ async function initBrowser(proxyServer = null) {
   const token = process.env.BROWSERLESS_TOKEN;
   if (!token) throw new Error('BROWSERLESS_TOKEN env var is required');
 
-  let wsEndpoint = `wss://chrome.browserless.io?token=${token}`;
+  // stealth + blockAds help with bot-gated sites (e.g. FINRA, FSS Korea) that
+  // otherwise serve a near-empty DOM to headless Chrome.
+  let wsEndpoint = `wss://chrome.browserless.io?token=${token}&stealth&blockAds`;
   if (proxyServer) {
     wsEndpoint += `&--proxy-server=${encodeURIComponent(proxyServer)}`;
   }
@@ -39,8 +45,10 @@ async function scrapeUrl(url, options = {}) {
   const {
     sourceName = 'Custom',
     linkContains = null,        // Link must contain this string
+    linkRegex = null,           // Link must match this regex (string source, case-insensitive)
     linkExcludes = [],          // Array of strings to exclude from links
     titleContains = null,       // Title must contain this string (case-insensitive)
+    titleExcludes = [],         // Array of strings to exclude from titles
     minTitleLength = 15,        // Minimum title length
     selector = 'a',             // CSS selector (default: all links)
     maxResults = null,          // Limit number of results
@@ -54,7 +62,8 @@ async function scrapeUrl(url, options = {}) {
     waitTime = 3000,            // Time to wait after page load (ms)
     screenshot = false,         // Take screenshot for debugging
     timezone = null,            // Timezone ID e.g. "Africa/Lusaka"
-    locale = null               // Locale e.g. "en-ZM"
+    locale = null,              // Locale e.g. "en-ZM"
+    fetchDateFromArticle = false // Visit each article to read its published date (for listings with no date)
   } = options;
 
   const page = await browser.newPage();
@@ -66,13 +75,9 @@ async function scrapeUrl(url, options = {}) {
       await page.emulateTimezone(timezone);
     }
 
-    // Set custom user agent if provided
-    if (userAgent) {
-      await page.setUserAgent(userAgent);
-    } else {
-      // Default mobile user agent (sometimes shows different content)
-      // await page.setUserAgent('Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36');
-    }
+    // Set user agent — default to a real desktop UA. Some sites (e.g. AMF Canada)
+    // serve a near-empty DOM to the headless default UA, so a realistic UA is important.
+    await page.setUserAgent(userAgent || DEFAULT_UA);
 
     // Set custom headers
     if (headers && Object.keys(headers).length > 0) {
@@ -145,46 +150,115 @@ async function scrapeUrl(url, options = {}) {
 
     // Extract headlines with filters
     const headlines = await page.evaluate((opts) => {
-      const { sourceName, linkContains, linkExcludes, titleContains, minTitleLength, selector } = opts;
+      const { sourceName, linkContains, linkRegexSrc, linkExcludes, titleContains, titleExcludes, minTitleLength, selector } = opts;
+      const linkRegex = linkRegexSrc ? new RegExp(linkRegexSrc, 'i') : null;
+
+      const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+      const DATE_TOKEN = '((\\d{4}-\\d{2}-\\d{2})|(\\d{1,2}\\/\\d{1,2}\\/\\d{4})|(\\d{1,2}\\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\.?\\s+\\d{4})|((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\.?\\s+\\d{1,2},?\\s+\\d{4}))';
+      const DATE_RE = new RegExp(DATE_TOKEN, 'i');
+
+      // Parse a date string into an ISO timestamp. Slash dates are treated as
+      // DD/MM/YYYY (European), matching the regulators we scrape.
+      function toISO(str) {
+        if (!str) return null;
+        str = str.trim();
+        let m;
+        if (/^\d{4}-\d{2}-\d{2}/.test(str)) { const d = new Date(str); return isNaN(d) ? null : d.toISOString(); }
+        if ((m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/))) { const d = new Date(Date.UTC(+m[3], +m[2] - 1, +m[1])); return isNaN(d) ? null : d.toISOString(); }
+        if ((m = str.match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?\s+(\d{4})$/))) { const mo = MONTHS[m[2].toLowerCase()]; if (mo == null) return null; const d = new Date(Date.UTC(+m[3], mo, +m[1])); return isNaN(d) ? null : d.toISOString(); }
+        if ((m = str.match(/^([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})$/))) { const mo = MONTHS[m[1].toLowerCase()]; if (mo == null) return null; const d = new Date(Date.UTC(+m[3], mo, +m[2])); return isNaN(d) ? null : d.toISOString(); }
+        return null;
+      }
+
+      // Look for the article's published date near the link: a <time datetime>
+      // in an ancestor, else a date string in surrounding text.
+      function findDate(a) {
+        let el = a;
+        for (let i = 0; i < 5 && el; i++) {
+          const t = el.querySelector && el.querySelector('time[datetime]');
+          if (t) { const iso = toISO(t.getAttribute('datetime')); if (iso) return iso; }
+          el = el.parentElement;
+        }
+        el = a;
+        for (let i = 0; i < 6 && el; i++) {
+          const m = (el.textContent || '').match(DATE_RE);
+          if (m) { const iso = toISO(m[0]); if (iso) return iso; }
+          el = el.parentElement;
+        }
+        return null;
+      }
+
+      // Pagination / navigation labels that are not real articles.
+      const JUNK_RE = /^(\d+|last|next|previous|prev|first|back|more|home|menu|search|subscribe|next\s*page.*|last\s*page.*|previous\s*page.*|first\s*page.*|page\s+\d+.*|go to .*|skip to .*|reverse chronological|.*current page.*|.*current sub-section.*|see all .*|view all.*|search all .*|connect with us|read more)$/i;
+
+      function cleanTitle(raw) {
+        let t = (raw || '').replace(/\s+/g, ' ').trim();
+        // Strip a trailing date the page concatenated onto the headline
+        // (e.g. ESMA "... newsletter 01/06/2026").
+        t = t.replace(new RegExp('[\\s,–-]*' + DATE_TOKEN + '\\s*$', 'i'), '').trim();
+        // Strip trailing "Link is external" accessibility noise (FCA etc.)
+        t = t.replace(/\s*Link is external\s*$/i, '').trim();
+        return t;
+      }
+
       const elements = Array.from(document.querySelectorAll(selector));
-      
-      return elements
-        .map(el => {
-          // Handle both <a> tags and other elements
-          const link = el.href || el.querySelector('a')?.href || '';
-          const title = el.innerText?.trim().replace(/\s+/g, ' ') || '';
-          return { source: sourceName, title, link };
-        })
-        .filter(item => {
-          // Title length filter
-          if (item.title.length < minTitleLength) return false;
-          
-          // Must be valid URL
-          if (!item.link.startsWith('http')) return false;
-          
-          // Link must contain pattern (if specified)
-          if (linkContains && !item.link.toLowerCase().includes(linkContains.toLowerCase())) return false;
-          
-          // Title must contain text (if specified)
-          if (titleContains && !item.title.toLowerCase().includes(titleContains.toLowerCase())) return false;
-          
-          // Default exclusions
-          const defaultExcludes = ['javascript:', 'mailto:', '#', 'login', 'signin', 'signup', 'register'];
-          if (defaultExcludes.some(p => item.link.toLowerCase().includes(p))) return false;
-          
-          // Custom exclusions
-          if (linkExcludes && linkExcludes.length > 0) {
-            if (linkExcludes.some(p => item.link.toLowerCase().includes(p.toLowerCase()))) return false;
-          }
-          
-          return true;
-        });
-    }, { sourceName, linkContains, linkExcludes, titleContains, minTitleLength, selector });
+      const seen = new Set();
+      const out = [];
+      for (const el of elements) {
+        const link = el.href || (el.querySelector('a') && el.querySelector('a').href) || '';
+        const published_at = findDate(el);
+        const title = cleanTitle(el.innerText || el.textContent || '');
+
+        if (title.length < minTitleLength) continue;
+        if (!link.startsWith('http')) continue;
+        if (linkContains && !link.toLowerCase().includes(linkContains.toLowerCase())) continue;
+        if (linkRegex && !linkRegex.test(link)) continue;
+        if (titleContains && !title.toLowerCase().includes(titleContains.toLowerCase())) continue;
+        if (JUNK_RE.test(title)) continue;
+
+        const defaultExcludes = ['javascript:', 'mailto:', '#', 'login', 'signin', 'signup', 'register'];
+        if (defaultExcludes.some(p => link.toLowerCase().includes(p))) continue;
+        if (linkExcludes && linkExcludes.some(p => link.toLowerCase().includes(p.toLowerCase()))) continue;
+        if (titleExcludes && titleExcludes.some(p => title.toLowerCase().includes(p.toLowerCase()))) continue;
+
+        if (seen.has(link)) continue;
+        seen.add(link);
+        out.push({ source: sourceName, title, link, published_at });
+      }
+      return out;
+    }, { sourceName, linkContains, linkRegexSrc: linkRegex, linkExcludes, titleContains, titleExcludes, minTitleLength, selector });
 
     await page.close();
-    
+
     // Apply maxResults if specified
     const finalHeadlines = maxResults ? headlines.slice(0, maxResults) : headlines;
+
+    // For listings that don't expose a date (e.g. AFME), optionally open each
+    // article and read the published date from its body.
+    if (fetchDateFromArticle) {
+      for (const h of finalHeadlines) {
+        if (h.published_at) continue;
+        try {
+          const ap = await browser.newPage();
+          await ap.setUserAgent(userAgent || DEFAULT_UA);
+          await ap.goto(h.link, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          await new Promise(r => setTimeout(r, 1500));
+          h.published_at = await ap.evaluate(() => {
+            const MO = { january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6, august: 7, september: 8, october: 9, november: 10, december: 11 };
+            const meta = document.querySelector('meta[property="article:published_time"], meta[name="article:published_time"], meta[itemprop="datePublished"]');
+            if (meta && meta.content) { const d = new Date(meta.content); if (!isNaN(d)) return d.toISOString(); }
+            const time = document.querySelector('time[datetime]');
+            if (time) { const d = new Date(time.getAttribute('datetime')); if (!isNaN(d)) return d.toISOString(); }
+            const m = (document.body.textContent || '').match(/\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b/i);
+            if (m) { const d = new Date(Date.UTC(+m[3], MO[m[2].toLowerCase()], +m[1])); if (!isNaN(d)) return d.toISOString(); }
+            return null;
+          });
+          await ap.close();
+        } catch (e) {
+          // Couldn't fetch article date — leave it null
+        }
+      }
+    }
     
     const result = { success: true, headlines: finalHeadlines, count: finalHeadlines.length };
     if (screenshotFile) {
@@ -254,8 +328,8 @@ app.post('/scrape-and-save', async (req, res) => {
     for (const headline of result.headlines) {
       const { error } = await supabase
         .from('headlines')
-        .upsert(headline, { onConflict: 'link', ignoreDuplicates: true });
-      
+        .upsert(headline, { onConflict: 'link' });
+
       if (error) skipped++;
       else inserted++;
     }
@@ -273,22 +347,22 @@ app.post('/scrape-and-save', async (req, res) => {
 
 const REGULATORS = [
   // UK
-  { name: 'FCA - News', region: 'UK', url: 'https://www.fca.org.uk/news', linkContains: '/news' },
+  { name: 'FCA - News', region: 'UK', url: 'https://www.fca.org.uk/news', linkContains: '/news', linkExcludes: ['/warnings'] },
   { name: 'FCA - Policy & Guidance', region: 'UK', url: 'https://www.fca.org.uk/publications/search-results?p_search_term=&category=policy%20and%20guidance', linkContains: '/publications' },
   { name: 'FCA - SFTR News', region: 'UK', url: 'https://www.fca.org.uk/markets/sftr/news', linkContains: '/sftr' },
-  { name: 'FCA - UK EMIR News', region: 'UK', url: 'https://www.fca.org.uk/firms/uk-emir/news', linkContains: '/emir' },
+  { name: 'FCA - UK EMIR News', region: 'UK', url: 'https://www.fca.org.uk/firms/uk-emir/news', linkContains: '/publication' },
   { name: 'FCA - MiFIR Transaction Reporting', region: 'UK', url: 'https://www.fca.org.uk/markets/transaction-reporting', linkContains: '/transaction-reporting' },
   { name: 'PRA', region: 'UK', url: 'https://www.bankofengland.co.uk/prudential-regulation/news', linkContains: '/news' },
   { name: 'Bank of England - Financial Stability', region: 'UK', url: 'https://www.bankofengland.co.uk/news/latest-and-upcoming', linkContains: '/news' },
   { name: 'UK T+1 Taskforce', region: 'UK', url: 'https://acceleratedsettlement.co.uk/news/', linkContains: '/news' },
   // EU
   { name: 'ESMA - News', region: 'EU', url: 'https://www.esma.europa.eu/press-news/esma-news', linkContains: '/esma-news' },
-  { name: 'ESMA - Library', region: 'EU', url: 'https://www.esma.europa.eu/databases-library/esma-library/', linkContains: '/library' },
+  { name: 'ESMA - Library', region: 'EU', url: 'https://www.esma.europa.eu/databases-library/esma-library/', linkContains: '/document', scrollPage: true },
   { name: 'ESMA - Consultations', region: 'EU', url: 'https://www.esma.europa.eu/press-news/consultations', linkContains: '/consultations' },
-  { name: 'AFME - Press Releases', region: 'EU', url: 'https://www.afme.eu/news/press-releases', linkContains: '/press-releases' },
+  { name: 'AFME - Press Releases', region: 'EU', url: 'https://www.afme.eu/news/press-releases', linkContains: '/press-releases', fetchDateFromArticle: true, maxResults: 25 },
   // Switzerland
   { name: 'FINMA - News', region: 'CH', url: 'https://www.finma.ch/en/news/', linkContains: '/news' },
-  { name: 'FINMA - Guidance', region: 'CH', url: 'https://www.finma.ch/en/documentation/finma-guidance/', linkContains: '/guidance' },
+  { name: 'FINMA - Guidance', region: 'CH', url: 'https://www.finma.ch/en/documentation/finma-guidance/', titleContains: 'guidance' },
   // Ireland
   { name: 'Central Bank of Ireland - News', region: 'IE', url: 'https://www.centralbank.ie/news-media', linkContains: '/news' },
   { name: 'Central Bank of Ireland - Schedule', region: 'IE', url: 'https://www.centralbank.ie/news-media/schedule', linkContains: '/schedule' },
@@ -298,18 +372,16 @@ const REGULATORS = [
   { name: 'SEC - Regulatory Agenda', region: 'US', url: 'https://www.reginfo.gov/public/do/eAgendaMain', linkContains: '/eAgenda' },
   { name: 'CFTC - Press Releases', region: 'US', url: 'https://www.cftc.gov/PressRoom/PressReleases', linkContains: '/PressReleases' },
   { name: 'CFTC - No Action Letters', region: 'US', url: 'https://www.cftc.gov/LawRegulation/CFTCStaffLetters/letters.htm', linkContains: '/letters' },
-  { name: 'FINRA - News Releases', region: 'US', url: 'https://www.finra.org/media-center/newsreleases', linkContains: '/newsreleases' },
+  { name: 'FINRA - News Releases', region: 'US', url: 'https://www.finra.org/media-center/newsreleases', linkContains: '/newsreleases', waitTime: 8000, scrollPage: true },
   { name: 'FINRA - TRACE Updates', region: 'US', url: 'https://www.finra.org/filing-reporting/market-transparency-reporting/trace/recent-updates', linkContains: '/trace' },
   { name: 'FINRA - CAT Announcements', region: 'US', url: 'https://www.catnmsplan.com/announcements', linkContains: '/announcements' },
   { name: 'FINRA - CAT Specifications', region: 'US', url: 'https://www.catnmsplan.com/specifications/im', linkContains: '/specifications' },
   { name: 'DTCC - US Treasury Clearing', region: 'US', url: 'https://www.dtcc.com/clearing-services/ficc-gov/treasury-clearing', linkContains: '/treasury' },
-  { name: 'DTCC - Learning Center', region: 'US', url: 'https://dtcclearning.com/', linkContains: null },
   // Canada
-  { name: 'AMF Canada - News', region: 'CA', url: 'https://lautorite.qc.ca/en/general-public/media-centre/news', linkContains: '/news' },
+  { name: 'AMF Canada - News', region: 'CA', url: 'https://lautorite.qc.ca/en/general-public/media-centre/news', linkContains: '/news', waitTime: 8000, scrollPage: true },
   { name: 'CSA Canada - News', region: 'CA', url: 'https://www.securities-administrators.ca/news/', linkContains: '/news' },
   { name: 'OSC Ontario - News', region: 'CA', url: 'https://www.osc.ca/en/news-events/news', linkContains: '/news' },
   { name: 'OSC Ontario - Publications', region: 'CA', url: 'https://www.osc.ca/en/news-events/reports-and-publications', linkContains: '/publications' },
-  { name: 'MSC Manitoba - Derivatives', region: 'CA', url: 'https://docs.mbsecurities.ca/msc/derivatives/en/0-9/nav_alpha.do', linkContains: '/derivatives' },
   // Asia Pacific
   { name: 'ASIC - Newsroom', region: 'AU', url: 'https://asic.gov.au/newsroom', linkContains: '/newsroom' },
   { name: 'ASIC - Derivatives Reporting', region: 'AU', url: 'https://asic.gov.au/regulatory-resources/markets/otc-derivatives/derivative-transaction-reporting/', linkContains: '/derivatives' },
@@ -326,8 +398,8 @@ const REGULATORS = [
   // Israel
   { name: 'Bank of Israel - Press Releases', region: 'IL', url: 'https://www.boi.org.il/en/communication-and-publications/press-releases/', linkContains: '/press-releases' },
   // Industry
-  { name: 'ISDA - Data & Reporting', region: 'Global', url: 'https://www.isda.org/category/infrastructure/data-and-reporting/', linkContains: '/data-and-reporting' },
-  { name: 'ISDA - Compliance Calendar', region: 'Global', url: 'https://www.isda.org/tag/compliance-calendar/', linkContains: '/compliance-calendar' },
+  { name: 'ISDA - Data & Reporting', region: 'Global', url: 'https://www.isda.org/category/infrastructure/data-and-reporting/', linkContains: null, linkRegex: '/20\\d\\d/\\d{2}/' },
+  { name: 'ISDA - Compliance Calendar', region: 'Global', url: 'https://www.isda.org/tag/compliance-calendar/', linkContains: null, linkRegex: '/20\\d\\d/\\d{2}/' },
 ];
 
 // Track whether a scrape run is already in progress
@@ -351,14 +423,22 @@ async function runAllScrapers() {
       const result = await scrapeUrl(reg.url, {
         sourceName: reg.name,
         linkContains: reg.linkContains,
-        waitTime: 3000,
+        linkRegex: reg.linkRegex,
+        linkExcludes: reg.linkExcludes,
+        titleContains: reg.titleContains,
+        titleExcludes: reg.titleExcludes,
+        maxResults: reg.maxResults,
+        scrollPage: reg.scrollPage || false,
+        fetchDateFromArticle: reg.fetchDateFromArticle || false,
+        waitTime: reg.waitTime || 3000,
       });
 
       if (result.success && result.headlines.length > 0) {
         for (const headline of result.headlines) {
+          // Merge (not ignore) so published_at backfills on existing rows.
           const { error } = await supabase
             .from('headlines')
-            .upsert(headline, { onConflict: 'link', ignoreDuplicates: true });
+            .upsert(headline, { onConflict: 'link' });
           if (error) skipped++;
           else inserted++;
         }
@@ -390,9 +470,12 @@ app.get('/scrape-status', (req, res) => {
 app.get('/headlines', async (req, res) => {
   const { source, limit } = req.query;
 
+  // Most recent article first. Fall back to scrape time when an article has no
+  // published date.
   let query = supabase
     .from('headlines')
     .select('*')
+    .order('published_at', { ascending: false, nullsFirst: false })
     .order('scraped_at', { ascending: false });
 
   if (source) {
