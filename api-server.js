@@ -149,7 +149,7 @@ async function scrapeUrl(url, options = {}) {
     }
 
     // Extract headlines with filters
-    const headlines = await page.evaluate((opts) => {
+    const EXTRACT = (opts) => {
       const { sourceName, linkContains, linkRegexSrc, linkExcludes, titleContains, titleExcludes, minTitleLength, selector } = opts;
       const linkRegex = linkRegexSrc ? new RegExp(linkRegexSrc, 'i') : null;
 
@@ -226,7 +226,18 @@ async function scrapeUrl(url, options = {}) {
         out.push({ source: sourceName, title, link, published_at });
       }
       return out;
-    }, { sourceName, linkContains, linkRegexSrc: linkRegex, linkExcludes, titleContains, titleExcludes, minTitleLength, selector });
+    };
+
+    const EXTRACT_ARGS = { sourceName, linkContains, linkRegexSrc: linkRegex, linkExcludes, titleContains, titleExcludes, minTitleLength, selector };
+    // Some sites client-side redirect just after load, destroying the execution
+    // context mid-eval (UK T+1, CSA Canada). Retry once after settling.
+    let headlines;
+    try {
+      headlines = await page.evaluate(EXTRACT, EXTRACT_ARGS);
+    } catch (e) {
+      await new Promise(r => setTimeout(r, 4000));
+      headlines = await page.evaluate(EXTRACT, EXTRACT_ARGS);
+    }
 
     await page.close();
 
@@ -371,7 +382,7 @@ const REGULATORS = [
   { name: 'SEC - Rulemaking', region: 'US', url: 'https://www.sec.gov/rules-regulations/rulemaking-index', linkContains: '/rules' },
   { name: 'SEC - Regulatory Agenda', region: 'US', url: 'https://www.reginfo.gov/public/do/eAgendaMain', linkContains: '/eAgenda' },
   { name: 'CFTC - Press Releases', region: 'US', url: 'https://www.cftc.gov/PressRoom/PressReleases', linkContains: '/PressReleases' },
-  { name: 'CFTC - No Action Letters', region: 'US', url: 'https://www.cftc.gov/LawRegulation/CFTCStaffLetters/letters.htm', linkContains: '/letters' },
+  { name: 'CFTC - No Action Letters', region: 'US', url: 'https://www.cftc.gov/LawRegulation/CFTCStaffLetters/letters.htm', linkContains: '/csl/', minTitleLength: 6 },
   { name: 'FINRA - News Releases', region: 'US', url: 'https://www.finra.org/media-center/newsreleases', linkContains: '/newsreleases', waitTime: 8000, scrollPage: true },
   { name: 'FINRA - TRACE Updates', region: 'US', url: 'https://www.finra.org/filing-reporting/market-transparency-reporting/trace/recent-updates', linkContains: '/trace' },
   { name: 'FINRA - CAT Announcements', region: 'US', url: 'https://www.catnmsplan.com/announcements', linkContains: '/announcements' },
@@ -381,7 +392,7 @@ const REGULATORS = [
   { name: 'AMF Canada - News', region: 'CA', url: 'https://lautorite.qc.ca/en/general-public/media-centre/news', linkContains: '/news', waitTime: 8000, scrollPage: true },
   { name: 'CSA Canada - News', region: 'CA', url: 'https://www.securities-administrators.ca/news/', linkContains: '/news' },
   { name: 'OSC Ontario - News', region: 'CA', url: 'https://www.osc.ca/en/news-events/news', linkContains: '/news' },
-  { name: 'OSC Ontario - Publications', region: 'CA', url: 'https://www.osc.ca/en/news-events/reports-and-publications', linkContains: '/publications' },
+  { name: 'OSC Ontario - Publications', region: 'CA', url: 'https://www.osc.ca/en/news-events/reports-and-publications', linkContains: 'reports-and-publications', scrollPage: true },
   // Asia Pacific
   { name: 'ASIC - Newsroom', region: 'AU', url: 'https://asic.gov.au/newsroom', linkContains: '/newsroom' },
   { name: 'ASIC - Derivatives Reporting', region: 'AU', url: 'https://asic.gov.au/regulatory-resources/markets/otc-derivatives/derivative-transaction-reporting/', linkContains: '/derivatives' },
@@ -393,8 +404,8 @@ const REGULATORS = [
   { name: 'FSS Korea - Press Releases', region: 'KR', url: 'https://english.fss.or.kr/fss/eng/promo/pressrel/list.jsp', linkContains: '/pressrel' },
   { name: 'FSS Korea - Rule Changes', region: 'KR', url: 'https://english.fss.or.kr/fss/eng/promo/rulechange/list.jsp', linkContains: '/rulechange' },
   { name: 'JFSA Japan - News', region: 'JP', url: 'https://www.fsa.go.jp/en/news/index.html', linkContains: '/news' },
-  { name: 'CSRC China - Rules', region: 'CN', url: 'http://www.csrc.gov.cn/csrc_en/c102033/common_list.shtml', linkContains: '/csrc_en' },
-  { name: 'CSRC China - Policy Q&A', region: 'CN', url: 'http://www.csrc.gov.cn/csrc_en/c102034/common_list.shtml', linkContains: '/csrc_en' },
+  { name: 'CSRC China - Rules', region: 'CN', url: 'http://www.csrc.gov.cn/csrc_en/c102033/common_list.shtml', linkContains: '/csrc_en', waitTime: 7000 },
+  { name: 'CSRC China - Policy Q&A', region: 'CN', url: 'http://www.csrc.gov.cn/csrc_en/c102034/common_list.shtml', linkContains: '/csrc_en', waitTime: 7000 },
   // Israel
   { name: 'Bank of Israel - Press Releases', region: 'IL', url: 'https://www.boi.org.il/en/communication-and-publications/press-releases/', linkContains: '/press-releases' },
   // Industry
@@ -427,6 +438,7 @@ async function runAllScrapers() {
         linkExcludes: reg.linkExcludes,
         titleContains: reg.titleContains,
         titleExcludes: reg.titleExcludes,
+        minTitleLength: reg.minTitleLength,
         maxResults: reg.maxResults,
         scrollPage: reg.scrollPage || false,
         fetchDateFromArticle: reg.fetchDateFromArticle || false,
