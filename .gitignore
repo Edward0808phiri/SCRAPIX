@@ -1,3 +1,4 @@
 node_modules/
 .env
 headlines.json
+scraped-headlines.json
