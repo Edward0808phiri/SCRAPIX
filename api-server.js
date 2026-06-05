@@ -353,19 +353,94 @@ app.post('/scrape-and-save', async (req, res) => {
 });
 
 // ============================================================================
+// RSS  — some sources are bot-gated (Cloudflare/DDoS-Guard) for a browser but
+// expose a public RSS/Atom feed over plain HTTP. When a source has `rss`, we
+// fetch the feed instead of driving a browser. Gives clean titles + real dates.
+// ============================================================================
+function decodeEntities(s) {
+  return (s || '')
+    .replace(/<!\[CDATA\[|\]\]>/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#0?39;|&apos;|&#x27;/gi, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n))
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function rssTag(block, name) {
+  const m = block.match(new RegExp('<' + name + '[^>]*>([\\s\\S]*?)<\\/' + name + '>', 'i'));
+  return m ? m[1] : '';
+}
+
+function parseFeed(xml, sourceName) {
+  const out = [];
+  const isAtom = /<entry[\s>]/i.test(xml) && !/<item[\s>]/i.test(xml);
+  const chunks = xml.split(isAtom ? /<entry[\s>]/i : /<item[\s>]/i).slice(1);
+  for (const raw of chunks) {
+    const block = raw.split(isAtom ? /<\/entry>/i : /<\/item>/i)[0];
+    const title = decodeEntities(rssTag(block, 'title'));
+    let link = decodeEntities(rssTag(block, 'link'));
+    if (!link) { const m = block.match(/<link[^>]*href=["']([^"']+)["']/i); if (m) link = m[1]; }
+    const dateStr = rssTag(block, 'pubDate') || rssTag(block, 'dc:date') || rssTag(block, 'published') || rssTag(block, 'updated');
+    let published_at = null;
+    if (dateStr) { const d = new Date(dateStr.trim()); if (!isNaN(d)) published_at = d.toISOString(); }
+    if (title && link && link.startsWith('http')) out.push({ source: sourceName, title, link, published_at });
+  }
+  return out;
+}
+
+// Read an article's publish date over plain HTTP (for feeds like FCA that omit
+// per-item dates). The article pages aren't bot-gated even when listings are.
+async function fetchArticleDate(url) {
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': DEFAULT_UA }, redirect: 'follow' });
+    const b = await res.text();
+    let m = b.match(/<meta[^>]+property=["']article:published_time["'][^>]+content=["']([^"']+)["']/i)
+         || b.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']article:published_time["']/i)
+         || b.match(/<time[^>]+datetime=["']([^"']+)["']/i);
+    if (m) { const d = new Date(m[1]); if (!isNaN(d)) return d.toISOString(); }
+    return null;
+  } catch { return null; }
+}
+
+async function fetchRss(reg, attempts = 3) {
+  let lastErr = 'unknown';
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(reg.rss, { headers: { 'User-Agent': DEFAULT_UA, 'Accept': 'application/rss+xml, application/xml, text/xml, */*' }, redirect: 'follow' });
+      const body = await res.text();
+      let items = parseFeed(body, reg.name);
+      if (reg.maxResults) items = items.slice(0, reg.maxResults);
+      if (reg.fetchDateFromArticle) {
+        for (const h of items) {
+          if (!h.published_at) h.published_at = await fetchArticleDate(h.link);
+        }
+      }
+      return { success: true, headlines: items, count: items.length };
+    } catch (e) {
+      // Some hosts intermittently drop the connection ("fetch failed"); retry.
+      lastErr = e.cause ? e.cause.message : e.message;
+      await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+    }
+  }
+  return { success: false, error: lastErr, headlines: [], count: 0 };
+}
+
+// ============================================================================
 // REGULATORY SOURCES
 // ============================================================================
 
 const REGULATORS = [
   // UK
-  { name: 'FCA - News', region: 'UK', url: 'https://www.fca.org.uk/news', linkContains: '/news', linkExcludes: ['/warnings'] },
-  { name: 'FCA - Policy & Guidance', region: 'UK', url: 'https://www.fca.org.uk/publications/search-results?p_search_term=&category=policy%20and%20guidance', linkContains: '/publications' },
+  { name: 'FCA - News', region: 'UK', url: 'https://www.fca.org.uk/news', rss: 'https://www.fca.org.uk/news/rss.xml', fetchDateFromArticle: true, maxResults: 20 },
+  { name: 'FCA - Policy & Guidance', region: 'UK', url: 'https://www.fca.org.uk/publications', rss: 'https://www.fca.org.uk/publications/rss.xml', fetchDateFromArticle: true, maxResults: 20 },
   { name: 'FCA - SFTR News', region: 'UK', url: 'https://www.fca.org.uk/markets/sftr/news', linkContains: '/sftr' },
   { name: 'FCA - UK EMIR News', region: 'UK', url: 'https://www.fca.org.uk/firms/uk-emir/news', linkContains: '/publication' },
   { name: 'FCA - MiFIR Transaction Reporting', region: 'UK', url: 'https://www.fca.org.uk/markets/transaction-reporting', linkContains: '/transaction-reporting' },
   { name: 'PRA', region: 'UK', url: 'https://www.bankofengland.co.uk/prudential-regulation/news', linkContains: '/news' },
   { name: 'Bank of England - Financial Stability', region: 'UK', url: 'https://www.bankofengland.co.uk/news/latest-and-upcoming', linkContains: '/news' },
-  { name: 'UK T+1 Taskforce', region: 'UK', url: 'https://acceleratedsettlement.co.uk/news/', linkContains: '/news' },
+  { name: 'UK T+1 Taskforce', region: 'UK', url: 'https://acceleratedsettlement.co.uk/news/', rss: 'https://acceleratedsettlement.co.uk/feed/' },
   // EU
   { name: 'ESMA - News', region: 'EU', url: 'https://www.esma.europa.eu/press-news/esma-news', linkContains: '/esma-news' },
   { name: 'ESMA - Library', region: 'EU', url: 'https://www.esma.europa.eu/databases-library/esma-library/', linkContains: '/document', scrollPage: true },
@@ -390,7 +465,7 @@ const REGULATORS = [
   { name: 'DTCC - US Treasury Clearing', region: 'US', url: 'https://www.dtcc.com/clearing-services/ficc-gov/treasury-clearing', linkContains: '/treasury' },
   // Canada
   { name: 'AMF Canada - News', region: 'CA', url: 'https://lautorite.qc.ca/en/general-public/media-centre/news', linkContains: '/news', waitTime: 8000, scrollPage: true },
-  { name: 'CSA Canada - News', region: 'CA', url: 'https://www.securities-administrators.ca/news/', linkContains: '/news' },
+  { name: 'CSA Canada - News', region: 'CA', url: 'https://www.securities-administrators.ca/news/', rss: 'https://www.securities-administrators.ca/news/feed/' },
   { name: 'OSC Ontario - News', region: 'CA', url: 'https://www.osc.ca/en/news-events/news', linkContains: '/news' },
   { name: 'OSC Ontario - Publications', region: 'CA', url: 'https://www.osc.ca/en/news-events/reports-and-publications', linkContains: 'reports-and-publications', scrollPage: true },
   // Asia Pacific
@@ -431,19 +506,21 @@ async function runAllScrapers() {
 
   for (const reg of REGULATORS) {
     try {
-      const result = await scrapeUrl(reg.url, {
-        sourceName: reg.name,
-        linkContains: reg.linkContains,
-        linkRegex: reg.linkRegex,
-        linkExcludes: reg.linkExcludes,
-        titleContains: reg.titleContains,
-        titleExcludes: reg.titleExcludes,
-        minTitleLength: reg.minTitleLength,
-        maxResults: reg.maxResults,
-        scrollPage: reg.scrollPage || false,
-        fetchDateFromArticle: reg.fetchDateFromArticle || false,
-        waitTime: reg.waitTime || 3000,
-      });
+      const result = reg.rss
+        ? await fetchRss(reg)
+        : await scrapeUrl(reg.url, {
+            sourceName: reg.name,
+            linkContains: reg.linkContains,
+            linkRegex: reg.linkRegex,
+            linkExcludes: reg.linkExcludes,
+            titleContains: reg.titleContains,
+            titleExcludes: reg.titleExcludes,
+            minTitleLength: reg.minTitleLength,
+            maxResults: reg.maxResults,
+            scrollPage: reg.scrollPage || false,
+            fetchDateFromArticle: reg.fetchDateFromArticle || false,
+            waitTime: reg.waitTime || 3000,
+          });
 
       if (result.success && result.headlines.length > 0) {
         for (const headline of result.headlines) {
