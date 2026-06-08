@@ -440,6 +440,41 @@ async function fetchRss(reg, attempts = 3) {
   return { success: false, error: lastErr, headlines: [], count: 0 };
 }
 
+// Some sites captcha every page AND feed, but leave their XML sitemap open (for
+// SEO crawlers). Pull recent article URLs + <lastmod> dates from there, and
+// build a readable title from the URL slug. Used for Bank of Israel (Radware).
+async function fetchSitemap(reg, attempts = 3) {
+  let lastErr = 'unknown';
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(reg.sitemap, { headers: { 'User-Agent': DEFAULT_UA }, redirect: 'follow' });
+      const xml = await res.text();
+      const re = new RegExp(reg.sitemapFilter, 'i');
+      const blocks = [...xml.matchAll(/<url>([\s\S]*?)<\/url>/gi)].map(m => m[1]);
+      let items = [];
+      for (const bk of blocks) {
+        const loc = (bk.match(/<loc>([^<]+)<\/loc>/i) || [])[1] || '';
+        if (!re.test(loc)) continue;
+        const slug = loc.replace(/\/$/, '').split('/').pop();
+        // Skip date-code slugs (e.g. "26-05-26ben") that make no readable title.
+        if (!slug || slug.length < 12 || /^\d/.test(slug)) continue;
+        const mod = (bk.match(/<lastmod>([^<]+)<\/lastmod>/i) || [])[1] || '';
+        let published_at = null;
+        if (mod) { const d = new Date(mod.trim()); if (!isNaN(d) && d.getTime() <= Date.now() + 864e5) published_at = d.toISOString(); }
+        const title = slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        items.push({ source: reg.name, title, link: loc, published_at });
+      }
+      items.sort((a, b) => (b.published_at || '').localeCompare(a.published_at || ''));
+      if (reg.maxResults) items = items.slice(0, reg.maxResults);
+      return { success: true, headlines: items, count: items.length };
+    } catch (e) {
+      lastErr = e.cause ? e.cause.message : e.message;
+      await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+    }
+  }
+  return { success: false, error: lastErr, headlines: [], count: 0 };
+}
+
 // ============================================================================
 // REGULATORY SOURCES
 // ============================================================================
@@ -495,7 +530,7 @@ const REGULATORS = [
   { name: 'CSRC China - Rules', region: 'CN', url: 'http://www.csrc.gov.cn/csrc_en/c102033/common_list.shtml', linkContains: '/csrc_en', waitTime: 7000 },
   { name: 'CSRC China - Policy Q&A', region: 'CN', url: 'http://www.csrc.gov.cn/csrc_en/c102034/common_list.shtml', linkContains: '/csrc_en', waitTime: 7000 },
   // Israel
-  { name: 'Bank of Israel - Press Releases', region: 'IL', url: 'https://www.boi.org.il/en/communication-and-publications/press-releases/', linkContains: '/press-releases' },
+  { name: 'Bank of Israel - Press Releases', region: 'IL', url: 'https://www.boi.org.il/en/communication-and-publications/press-releases/', sitemap: 'https://www.boi.org.il/en/sitemap.xml', sitemapFilter: '/press-releases/[^/]+/?$', maxResults: 25 },
   // Industry
   { name: 'ISDA - Data & Reporting', region: 'Global', url: 'https://www.isda.org/category/infrastructure/data-and-reporting/', linkContains: null, linkRegex: '/20\\d\\d/\\d{2}/' },
   { name: 'ISDA - Compliance Calendar', region: 'Global', url: 'https://www.isda.org/tag/compliance-calendar/', linkContains: null, linkRegex: '/20\\d\\d/\\d{2}/' },
@@ -519,7 +554,9 @@ async function runAllScrapers() {
 
   for (const reg of REGULATORS) {
     try {
-      const result = reg.rss
+      const result = reg.sitemap
+        ? await fetchSitemap(reg)
+        : reg.rss
         ? await fetchRss(reg)
         : await scrapeUrl(reg.url, {
             sourceName: reg.name,
