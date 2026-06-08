@@ -130,7 +130,7 @@ const REGULATORS = [
   { name: 'OSC Ontario - Publications', region: 'CA', url: 'https://www.osc.ca/en/news-events/reports-and-publications', linkContains: 'reports-and-publications', scrollPage: true },
   // Asia Pacific
   { name: 'ASIC - Newsroom', region: 'AU', url: 'https://asic.gov.au/newsroom', linkContains: '/newsroom' },
-  { name: 'ASIC - Derivatives Reporting', region: 'AU', url: 'https://asic.gov.au/regulatory-resources/markets/otc-derivatives/derivative-transaction-reporting/', linkContains: '/derivatives' },
+  { name: 'ASIC - Regulatory Resources', region: 'AU', url: 'https://www.asic.gov.au/regulatory-resources/regulatory-resources-search/', linkContains: '/find-a-document', waitUntil: 'networkidle2', waitTime: 6000, maxResults: 25 },
   { name: 'HKMA - Press Releases', region: 'HK', url: 'https://www.hkma.gov.hk/eng/news-and-media/press-releases/', linkContains: '/press-releases' },
   { name: 'SFC Hong Kong - Circulars', region: 'HK', url: 'https://apps.sfc.hk/edistributionWeb/gateway/EN/circular/', linkContains: '/circular' },
   { name: 'MAS Singapore - News', region: 'SG', url: 'https://www.mas.gov.sg/news', linkContains: '/news' },
