@@ -206,7 +206,9 @@ async function scrapeUrl(url, options = {}) {
       const out = [];
       for (const el of elements) {
         const link = el.href || (el.querySelector('a') && el.querySelector('a').href) || '';
-        const published_at = findDate(el);
+        let published_at = findDate(el);
+        // A publish date can't be in the future — that's an event/deadline date, not a publish date.
+        if (published_at && new Date(published_at).getTime() > Date.now() + 864e5) published_at = null;
         const title = cleanTitle(el.innerText || el.textContent || '');
 
         if (title.length < minTitleLength) continue;
@@ -384,7 +386,7 @@ function parseFeed(xml, sourceName) {
     if (!link) { const m = block.match(/<link[^>]*href=["']([^"']+)["']/i); if (m) link = m[1]; }
     const dateStr = rssTag(block, 'pubDate') || rssTag(block, 'dc:date') || rssTag(block, 'published') || rssTag(block, 'updated');
     let published_at = null;
-    if (dateStr) { const d = new Date(dateStr.trim()); if (!isNaN(d)) published_at = d.toISOString(); }
+    if (dateStr) { const d = new Date(dateStr.trim()); if (!isNaN(d) && d.getTime() <= Date.now() + 864e5) published_at = d.toISOString(); }
     if (title && link && link.startsWith('http')) out.push({ source: sourceName, title, link, published_at });
   }
   return out;
@@ -399,7 +401,7 @@ async function fetchArticleDate(url) {
     let m = b.match(/<meta[^>]+property=["']article:published_time["'][^>]+content=["']([^"']+)["']/i)
          || b.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']article:published_time["']/i)
          || b.match(/<time[^>]+datetime=["']([^"']+)["']/i);
-    if (m) { const d = new Date(m[1]); if (!isNaN(d)) return d.toISOString(); }
+    if (m) { const d = new Date(m[1]); if (!isNaN(d) && d.getTime() <= Date.now() + 864e5) return d.toISOString(); }
     return null;
   } catch { return null; }
 }
