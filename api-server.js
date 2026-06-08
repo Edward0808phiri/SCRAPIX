@@ -17,7 +17,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Realistic desktop UA — some regulator sites serve an empty DOM to the default
 // headless user agent.
-const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
 let browser = null;
 
@@ -60,6 +60,7 @@ async function scrapeUrl(url, options = {}) {
     scrollPage = false,         // Scroll to load more content
     scrollCount = 3,            // Number of scroll iterations
     waitTime = 3000,            // Time to wait after page load (ms)
+    waitUntil = 'domcontentloaded', // 'networkidle2' lets Cloudflare JS challenges resolve (FINRA)
     screenshot = false,         // Take screenshot for debugging
     timezone = null,            // Timezone ID e.g. "Africa/Lusaka"
     locale = null,              // Locale e.g. "en-ZM"
@@ -78,6 +79,7 @@ async function scrapeUrl(url, options = {}) {
     // Set user agent — default to a real desktop UA. Some sites (e.g. AMF Canada)
     // serve a near-empty DOM to the headless default UA, so a realistic UA is important.
     await page.setUserAgent(userAgent || DEFAULT_UA);
+    await page.setViewport({ width: 1366, height: 768 });
 
     // Set custom headers
     if (headers && Object.keys(headers).length > 0) {
@@ -105,8 +107,8 @@ async function scrapeUrl(url, options = {}) {
       await page.setCookie(...cookies);
     }
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    
+    await page.goto(url, { waitUntil, timeout: 60000 });
+
     // Wait for specific element if specified
     if (waitForSelector) {
       try {
@@ -118,6 +120,15 @@ async function scrapeUrl(url, options = {}) {
 
     // Wait for content
     await new Promise(r => setTimeout(r, waitTime));
+
+    // If we landed on a Cloudflare/anti-bot interstitial, give it time to clear.
+    try {
+      for (let i = 0; i < 8; i++) {
+        const t = await page.title();
+        if (!/just a moment|attention required|one moment|checking your browser/i.test(t)) break;
+        await new Promise(r => setTimeout(r, 2500));
+      }
+    } catch {}
 
     // Scroll page to load more content (infinite scroll)
     if (scrollPage) {
@@ -460,8 +471,8 @@ const REGULATORS = [
   { name: 'SEC - Regulatory Agenda', region: 'US', url: 'https://www.reginfo.gov/public/do/eAgendaMain', linkContains: '/eAgenda' },
   { name: 'CFTC - Press Releases', region: 'US', url: 'https://www.cftc.gov/PressRoom/PressReleases', linkContains: '/PressReleases' },
   { name: 'CFTC - No Action Letters', region: 'US', url: 'https://www.cftc.gov/LawRegulation/CFTCStaffLetters/letters.htm', linkContains: '/csl/', minTitleLength: 6 },
-  { name: 'FINRA - News Releases', region: 'US', url: 'https://www.finra.org/media-center/newsreleases', linkContains: '/newsreleases', waitTime: 8000, scrollPage: true },
-  { name: 'FINRA - TRACE Updates', region: 'US', url: 'https://www.finra.org/filing-reporting/market-transparency-reporting/trace/recent-updates', linkContains: '/trace' },
+  { name: 'FINRA - News Releases', region: 'US', url: 'https://www.finra.org/media-center/newsreleases', linkContains: '/newsreleases', waitUntil: 'networkidle2', waitTime: 10000, scrollPage: true },
+  { name: 'FINRA - TRACE Updates', region: 'US', url: 'https://www.finra.org/filing-reporting/market-transparency-reporting/trace/recent-updates', linkContains: '/trace', waitUntil: 'networkidle2', waitTime: 10000 },
   { name: 'FINRA - CAT Announcements', region: 'US', url: 'https://www.catnmsplan.com/announcements', linkContains: '/announcements' },
   { name: 'FINRA - CAT Specifications', region: 'US', url: 'https://www.catnmsplan.com/specifications/im', linkContains: '/specifications' },
   { name: 'DTCC - US Treasury Clearing', region: 'US', url: 'https://www.dtcc.com/clearing-services/ficc-gov/treasury-clearing', linkContains: '/treasury' },
@@ -522,6 +533,7 @@ async function runAllScrapers() {
             scrollPage: reg.scrollPage || false,
             fetchDateFromArticle: reg.fetchDateFromArticle || false,
             waitTime: reg.waitTime || 3000,
+            waitUntil: reg.waitUntil || 'domcontentloaded',
           });
 
       if (result.success && result.headlines.length > 0) {
